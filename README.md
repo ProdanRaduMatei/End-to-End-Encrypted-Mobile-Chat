@@ -190,8 +190,11 @@ This project demonstrates:
 ## 👤 Author
 
 Matei Prodan, Vlad Stoian, Andrei Voinea
+
 MSc Applied Computational Intelligence
+
 Babeș-Bolyai University
+
 Cryptography and Arithmetic — Mobile Security Project
 
 ---
