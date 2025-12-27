@@ -187,7 +187,7 @@ This project demonstrates:
 
 ---
 
-## 👤 Author
+## 👤 Authors
 
 Matei Prodan, Vlad Stoian, Andrei Voinea
 
