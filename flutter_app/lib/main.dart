@@ -1,7 +1,8 @@
 import 'package:flutter/material.dart';
 import 'screens/login.dart';
-import 'screens/users.dart';
 import 'screens/chat.dart';
+import 'screens/connections.dart';
+import 'screens/verify_key.dart';
 
 void main() {
   runApp(const MiniSignalApp());
@@ -22,7 +23,8 @@ class MiniSignalApp extends StatelessWidget {
       initialRoute: '/',
       routes: {
         '/': (context) => const LoginScreen(),
-        '/users': (context) => const UsersScreen(),
+        '/connections': (context) => const ConnectionsScreen(),
+        '/verify': (context) => const VerifyKeyScreen(),
         '/chat': (context) => const ChatScreen(),
       },
     );

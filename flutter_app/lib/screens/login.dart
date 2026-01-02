@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import '../api.dart';
 import '../auth_store.dart';
+import '../config.dart';
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
@@ -16,8 +17,7 @@ class _LoginScreenState extends State<LoginScreen> {
   // Android emulator: http://10.0.2.2:8000
   // iOS simulator: http://localhost:8000
   // Physical device: http://<your-laptop-ip>:8000
-  final Api api = Api("http://10.0.2.2:8000");
-
+  final Api api = Api(AppConfig.baseUrl);
   final AuthStore auth = AuthStore();
 
   final _emailCtrl = TextEditingController();
@@ -69,7 +69,7 @@ class _LoginScreenState extends State<LoginScreen> {
       await api.uploadKey(token, pubKeyB64);
 
       if (!mounted) return;
-      Navigator.of(context).pushReplacementNamed('/users');
+      Navigator.of(context).pushReplacementNamed('/connections');
     } catch (e) {
       _snack("Auth failed: ${e.toString()}");
     } finally {

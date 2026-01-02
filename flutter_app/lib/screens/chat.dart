@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
+import 'dart:math';
+
 import '../api.dart';
 import '../auth_store.dart';
 import '../crypto_service.dart';
-import 'dart:math';
+import '../config.dart';
 
 class ChatScreen extends StatefulWidget {
   const ChatScreen({super.key});
@@ -27,8 +29,7 @@ class _ChatMessage {
 }
 
 class _ChatScreenState extends State<ChatScreen> {
-  // CHANGE THIS IF NEEDED:
-  final Api api = Api("http://10.0.2.2:8000");
+  final Api api = Api(AppConfig.baseUrl);
   final AuthStore auth = AuthStore();
   final CryptoService crypto = CryptoService();
 
@@ -41,20 +42,31 @@ class _ChatScreenState extends State<ChatScreen> {
 
   int? _myId;
 
-  late int _peerId;
-  late String _peerEmail;
+  int? _peerId;
+  String? _peerEmail;
 
-  String? _chatId; // canonical
-  dynamic
-  _sessionKey; // SecretKey type (from cryptography package), keep dynamic to avoid extra imports
+  String? _chatId; // canonical "minId_maxId"
+  dynamic _sessionKey; // SecretKey from cryptography (kept dynamic)
 
   final List<_ChatMessage> _messages = [];
+
+  bool _didInit = false;
 
   @override
   void dispose() {
     _msgCtrl.dispose();
     _scrollCtrl.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_didInit) return;
+    _didInit = true;
+
+    // Safe: route args available here
+    WidgetsBinding.instance.addPostFrameCallback((_) => _init());
   }
 
   void _snack(String msg) {
@@ -75,9 +87,12 @@ class _ChatScreenState extends State<ChatScreen> {
     });
 
     try {
-      final args = ModalRoute.of(context)!.settings.arguments as Map?;
-      if (args == null || args["peerId"] == null || args["peerEmail"] == null) {
+      final args = ModalRoute.of(context)?.settings.arguments;
+      if (args is! Map) {
         throw Exception("Missing chat arguments.");
+      }
+      if (args["peerId"] == null || args["peerEmail"] == null) {
+        throw Exception("Missing chat arguments (peerId/peerEmail).");
       }
 
       _peerId = args["peerId"] as int;
@@ -85,7 +100,6 @@ class _ChatScreenState extends State<ChatScreen> {
 
       final token = await auth.token();
       final myId = await auth.userId();
-      final myEmail = await auth.email();
 
       if (token == null || myId == null) {
         if (!mounted) return;
@@ -94,20 +108,31 @@ class _ChatScreenState extends State<ChatScreen> {
       }
 
       _myId = myId;
-      _chatId = _canonicalChatId(myId, _peerId);
+      _chatId = _canonicalChatId(myId, _peerId!);
 
       // Ensure my identity keypair exists
       final myKeyPair = await auth.getOrCreateIdentityKeyPair();
 
-      // Fetch peer public key
-      final peerKeyRes = await api.getKey(token, _peerId);
-      final peerPubB64 = peerKeyRes["public_key_b64"] as String?;
+      // ✅ Load peer public key from locally stored contact first, fallback to server
+      String? peerPubB64;
+      final contacts = await auth.getContacts();
+      final stored = contacts.where((c) => c["id"] == _peerId).toList();
+      if (stored.isNotEmpty) {
+        peerPubB64 = stored.first["public_key_b64"] as String?;
+      }
+
+      if (peerPubB64 == null || peerPubB64.isEmpty) {
+        final peerKeyRes = await api.getKey(token, _peerId!);
+        peerPubB64 = peerKeyRes["public_key_b64"] as String?;
+      }
+
       if (peerPubB64 == null || peerPubB64.isEmpty) {
         throw Exception("Peer has no public key uploaded.");
       }
+
       final peerPub = crypto.importPublicKeyB64(peerPubB64);
 
-      // Derive session key from ECDH + HKDF
+      // Derive session key from X25519 + HKDF(chatId)
       _sessionKey = await crypto.deriveSessionKey(
         myKeyPair: myKeyPair,
         peerPublicKey: peerPub,
@@ -116,7 +141,6 @@ class _ChatScreenState extends State<ChatScreen> {
 
       setState(() => _loading = false);
 
-      // Initial fetch
       await _refreshInbox();
     } catch (e) {
       setState(() {
@@ -128,7 +152,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _refreshInbox() async {
     final token = await auth.token();
-    if (token == null || _myId == null) return;
+    if (token == null || _myId == null || _chatId == null) return;
 
     try {
       final raw = await api.inbox(token);
@@ -138,7 +162,6 @@ class _ChatScreenState extends State<ChatScreen> {
         return chatId == _chatId;
       }).toList();
 
-      // Decrypt incoming messages
       final incoming = <_ChatMessage>[];
       for (final m in filtered) {
         final senderId = m["sender_id"] as int;
@@ -146,7 +169,7 @@ class _ChatScreenState extends State<ChatScreen> {
         final ctB64 = m["ciphertext_b64"] as String;
         final ts = m["timestamp"] as int;
 
-        // AAD must match how sender encrypted it
+        // Must match sender AAD
         final aad = "${_chatId!}|from:$senderId|to:${_myId!}";
 
         try {
@@ -156,7 +179,6 @@ class _ChatScreenState extends State<ChatScreen> {
             ciphertextB64: ctB64,
             aad: aad,
           );
-
           incoming.add(
             _ChatMessage(
               isMine: false,
@@ -166,7 +188,6 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
           );
         } catch (_) {
-          // If decryption fails, show placeholder
           incoming.add(
             _ChatMessage(
               isMine: false,
@@ -178,8 +199,7 @@ class _ChatScreenState extends State<ChatScreen> {
         }
       }
 
-      // Merge: keep local outgoing messages + replace incoming
-      // (Backend inbox only returns received messages.)
+      // Backend inbox returns only received messages; keep local sent messages
       final mine = _messages.where((x) => x.isMine).toList();
       final merged = [...mine, ...incoming]
         ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
@@ -199,7 +219,14 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _send() async {
     final text = _msgCtrl.text.trim();
     if (text.isEmpty) return;
-    if (_sessionKey == null || _myId == null || _chatId == null) return;
+
+    if (_sessionKey == null ||
+        _myId == null ||
+        _peerId == null ||
+        _chatId == null) {
+      _snack("Chat not ready yet.");
+      return;
+    }
 
     final token = await auth.token();
     if (token == null) return;
@@ -209,8 +236,8 @@ class _ChatScreenState extends State<ChatScreen> {
     try {
       final ts = DateTime.now().millisecondsSinceEpoch;
 
-      // AAD binds metadata
-      final aad = "${_chatId!}|from:${_myId!}|to:$_peerId";
+      // AAD binds chat metadata
+      final aad = "${_chatId!}|from:${_myId!}|to:${_peerId!}";
 
       final enc = await crypto.encryptMessage(
         sessionKey: _sessionKey,
@@ -220,14 +247,13 @@ class _ChatScreenState extends State<ChatScreen> {
 
       await api.sendMessage(
         token: token,
-        toUserId: _peerId,
+        toUserId: _peerId!,
         chatId: _chatId!,
         nonceB64: enc["nonce_b64"]!,
         ciphertextB64: enc["ciphertext_b64"]!,
         timestamp: ts,
       );
 
-      // Add locally as "sent"
       setState(() {
         _messages.add(_ChatMessage(isMine: true, text: text, timestamp: ts));
       });
@@ -255,19 +281,11 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   Widget build(BuildContext context) {
-    // Init once when screen is first built (needs context for route args)
-    if (_loading && _error == null && _sessionKey == null) {
-      // avoid repeated init calls
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (_sessionKey == null && mounted) _init();
-      });
-    }
-
     final cs = Theme.of(context).colorScheme;
 
     return Scaffold(
       appBar: AppBar(
-        title: Text(_error != null ? "Chat" : _peerEmail),
+        title: Text(_peerEmail ?? "Chat"),
         actions: [
           IconButton(
             tooltip: "Refresh",
@@ -304,6 +322,7 @@ class _ChatScreenState extends State<ChatScreen> {
                             _error = null;
                             _sessionKey = null;
                             _loading = true;
+                            _messages.clear();
                           });
                           _init();
                         },
@@ -315,7 +334,6 @@ class _ChatScreenState extends State<ChatScreen> {
               )
             : Column(
                 children: [
-                  // Header hint (minimal, modern)
                   Padding(
                     padding: const EdgeInsets.fromLTRB(14, 10, 14, 6),
                     child: Row(
@@ -336,8 +354,6 @@ class _ChatScreenState extends State<ChatScreen> {
                       ],
                     ),
                   ),
-
-                  // Messages
                   Expanded(
                     child: ListView.builder(
                       controller: _scrollCtrl,
@@ -400,8 +416,6 @@ class _ChatScreenState extends State<ChatScreen> {
                       },
                     ),
                   ),
-
-                  // Composer
                   Padding(
                     padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
                     child: Row(

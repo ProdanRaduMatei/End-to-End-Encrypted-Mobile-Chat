@@ -89,4 +89,17 @@ class Api {
     final decoded = jsonDecode(r.body) as Map<String, dynamic>;
     return (decoded["messages"] as List<dynamic>);
   }
+
+  Future<Map<String, dynamic>> getUserByEmail(
+    String token,
+    String email,
+  ) async {
+    final encoded = Uri.encodeComponent(email.trim().toLowerCase());
+    final r = await http.get(
+      Uri.parse("$baseUrl/users/by-email/$encoded"),
+      headers: {"Authorization": "Bearer $token"},
+    );
+    if (r.statusCode >= 400) throw Exception(r.body);
+    return jsonDecode(r.body) as Map<String, dynamic>;
+  }
 }
