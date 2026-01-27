@@ -1,6 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'dart:math';
+import 'dart:convert';
+import '../verification_service.dart';
+import 'verification_screen.dart';
 
 import '../api.dart';
 import '../auth_store.dart';
@@ -51,6 +54,12 @@ class _ChatScreenState extends State<ChatScreen> {
   final List<_ChatMessage> _messages = [];
 
   bool _didInit = false;
+
+  // ✅ Verification fields
+  final VerificationService _verificationService = VerificationService();
+  bool _isVerified = false;
+  String? _safetyNumber;
+  String? _peerPublicKeyB64; // Store for safety number generation
 
   @override
   void dispose() {
@@ -130,6 +139,9 @@ class _ChatScreenState extends State<ChatScreen> {
         throw Exception("Peer has no public key uploaded.");
       }
 
+      // ✅ Store peer public key for verification
+      _peerPublicKeyB64 = peerPubB64;
+
       final peerPub = crypto.importPublicKeyB64(peerPubB64);
 
       // Derive session key from X25519 + HKDF(chatId)
@@ -138,6 +150,10 @@ class _ChatScreenState extends State<ChatScreen> {
         peerPublicKey: peerPub,
         chatId: _chatId!,
       );
+
+      // ✅ Load verification status and generate safety number
+      await _loadVerificationStatus();
+      await _generateSafetyNumber(myKeyPair);
 
       setState(() => _loading = false);
 
@@ -148,6 +164,85 @@ class _ChatScreenState extends State<ChatScreen> {
         _loading = false;
       });
     }
+  }
+
+  // ✅ Load verification status
+  Future<void> _loadVerificationStatus() async {
+    if (_chatId == null) return;
+    final verified = await _verificationService.isVerified(_chatId!);
+    setState(() {
+      _isVerified = verified;
+    });
+  }
+
+  // ✅ Generate safety number
+  Future<void> _generateSafetyNumber(dynamic myKeyPair) async {
+    if (_peerPublicKeyB64 == null || _myId == null || _peerId == null) {
+      return;
+    }
+
+    try {
+      // Get my username (email)
+      final myUsername = await auth.email() ?? "user_$_myId";
+      
+      // Get my public key bytes
+      final myPublicKeyBytes = myKeyPair.publicKey.bytes as List<int>;
+      
+      // Get peer public key bytes
+      final peerPublicKeyBytes = base64Decode(_peerPublicKeyB64!);
+      
+      // Peer username
+      final peerUsername = _peerEmail ?? "user_$_peerId";
+
+      // Generate safety number
+      final safetyNum = await _verificationService.generateSafetyNumber(
+        myPublicKeyBytes: myPublicKeyBytes,
+        myUsername: myUsername,
+        theirPublicKeyBytes: peerPublicKeyBytes,
+        theirUsername: peerUsername,
+      );
+
+      // Format for display
+      final formatted = _verificationService.formatSafetyNumber(safetyNum);
+
+      setState(() {
+        _safetyNumber = formatted;
+      });
+    } catch (e) {
+      debugPrint("Error generating safety number: $e");
+    }
+  }
+
+  // ✅ Show verification screen
+  void _showVerificationScreen() {
+    if (_safetyNumber == null) {
+      _snack('Generating safety number...');
+      return;
+    }
+
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => VerificationScreen(
+          safetyNumber: _safetyNumber!,
+          peerUsername: _peerEmail ?? "user_$_peerId",
+          isCurrentlyVerified: _isVerified,
+          onVerificationChanged: (verified) async {
+            if (_chatId == null) return;
+            
+            if (verified) {
+              await _verificationService.markAsVerified(_chatId!);
+            } else {
+              await _verificationService.markAsUnverified(_chatId!);
+            }
+            
+            setState(() {
+              _isVerified = verified;
+            });
+          },
+        ),
+      ),
+    );
   }
 
   Future<void> _refreshInbox() async {
@@ -285,8 +380,26 @@ class _ChatScreenState extends State<ChatScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: Text(_peerEmail ?? "Chat"),
+        // ✅ Updated title with verification badge
+        title: Row(
+          children: [
+            Text(_peerEmail ?? "Chat"),
+            if (_isVerified) ...[
+              const SizedBox(width: 8),
+              const Icon(Icons.verified_user, color: Colors.green, size: 20),
+            ],
+          ],
+        ),
         actions: [
+          // ✅ Verification button
+          IconButton(
+            tooltip: _isVerified ? "Verified" : "Verify Identity",
+            onPressed: _showVerificationScreen,
+            icon: Icon(
+              _isVerified ? Icons.verified_user : Icons.security,
+              color: _isVerified ? Colors.green : null,
+            ),
+          ),
           IconButton(
             tooltip: "Refresh",
             onPressed: _loading ? null : _refreshInbox,
