@@ -1,41 +1,99 @@
 import 'dart:convert';
-import 'dart:typed_data';
+import 'dart:math';
 import 'package:cryptography/cryptography.dart';
 
 class CryptoService {
   final X25519 _x25519 = X25519();
   final Cipher _aead = Chacha20.poly1305Aead();
-  final Hkdf _hkdf = Hkdf(hmac: Hmac.sha256(), outputLength: 32);
+  final Hmac _hmac = Hmac.sha256();
 
-  Future<SimpleKeyPair> generateIdentityKeyPair() async {
-    return _x25519.newKeyPair();
+  static const String _hkdfSaltStr = "mini-signal-salt";
+  static String hkdfInfoForChat(String chatId) => "chat:$chatId";
+
+  final Random _rng = Random.secure();
+
+  // ---------- Identity keys ----------
+
+  Future<SimpleKeyPairData> generateIdentityKeyPair() async {
+    final kp = await _x25519.newKeyPair();
+    return await kp.extract();
   }
 
-  Future<String> exportPublicKeyB64(SimpleKeyPair keyPair) async {
-    final pub = await keyPair.extractPublicKey();
-    return base64Encode(Uint8List.fromList(pub.bytes));
+  Future<String> exportPublicKeyB64(SimpleKeyPairData myKeyPair) async {
+    return base64Encode(myKeyPair.publicKey.bytes); // raw32
   }
 
   SimplePublicKey importPublicKeyB64(String b64) {
-    final bytes = base64Decode(b64);
-    return SimplePublicKey(bytes, type: KeyPairType.x25519);
+    final raw = base64Decode(b64);
+    return SimplePublicKey(raw, type: KeyPairType.x25519);
+  }
+
+  // ---------- HKDF-SHA256 (manual) ----------
+
+  Future<List<int>> _hmacSha256(List<int> key, List<int> data) async {
+    final mac = await _hmac.calculateMac(data, secretKey: SecretKey(key));
+    return mac.bytes;
+  }
+
+  Future<List<int>> _hkdfExtract({
+    required List<int> salt,
+    required List<int> ikm,
+  }) async {
+    // PRK = HMAC(salt, IKM)
+    return _hmacSha256(salt, ikm);
+  }
+
+  Future<List<int>> _hkdfExpand({
+    required List<int> prk,
+    required List<int> info,
+    required int length,
+  }) async {
+    // HKDF-Expand:
+    // T(0) = empty
+    // T(1) = HMAC(PRK, T(0) || info || 0x01)
+    // ...
+    final out = <int>[];
+    var t = <int>[];
+    var counter = 1;
+
+    while (out.length < length) {
+      final input = <int>[...t, ...info, counter];
+      t = await _hmacSha256(prk, input);
+      out.addAll(t);
+      counter++;
+      if (counter > 255) {
+        throw StateError("HKDF counter overflow");
+      }
+    }
+    return out.sublist(0, length);
   }
 
   Future<SecretKey> deriveSessionKey({
-    required SimpleKeyPair myKeyPair,
+    required SimpleKeyPairData myKeyPair,
     required SimplePublicKey peerPublicKey,
     required String chatId,
   }) async {
+    // 1) ECDH shared secret
     final shared = await _x25519.sharedSecretKey(
       keyPair: myKeyPair,
       remotePublicKey: peerPublicKey,
     );
+    final ikm = await shared.extractBytes();
 
-    final salt = utf8.encode("mini-signal-salt");
-    final info = utf8.encode("chat:$chatId");
+    // 2) HKDF-Extract + HKDF-Expand
+    final salt = utf8.encode(_hkdfSaltStr);
+    final info = utf8.encode(hkdfInfoForChat(chatId));
 
-    // cryptography package uses `nonce` for HKDF salt
-    return _hkdf.deriveKey(secretKey: shared, nonce: salt, info: info);
+    final prk = await _hkdfExtract(salt: salt, ikm: ikm);
+    final okm = await _hkdfExpand(prk: prk, info: info, length: 32);
+
+    return SecretKey(okm);
+  }
+
+  // ---------- AEAD ----------
+
+  List<int> _randomNonce12() {
+    return List<int>.generate(12, (_) => _rng.nextInt(256));
   }
 
   Future<Map<String, String>> encryptMessage({
@@ -43,7 +101,8 @@ class CryptoService {
     required String plaintext,
     required String aad,
   }) async {
-    final nonce = _aead.newNonce();
+    final nonce = _randomNonce12();
+
     final secretBox = await _aead.encrypt(
       utf8.encode(plaintext),
       secretKey: sessionKey,
@@ -51,15 +110,14 @@ class CryptoService {
       aad: utf8.encode(aad),
     );
 
-    // Store cipherText || mac (16 bytes)
-    final combined = Uint8List.fromList([
-      ...secretBox.cipherText,
-      ...secretBox.mac.bytes,
-    ]);
+    // ciphertext + 16-byte tag
+    final ct = secretBox.cipherText;
+    final tag = secretBox.mac.bytes;
+    final ctAndTag = <int>[...ct, ...tag];
 
     return {
       "nonce_b64": base64Encode(nonce),
-      "ciphertext_b64": base64Encode(combined),
+      "ciphertext_b64": base64Encode(ctAndTag),
     };
   }
 
@@ -70,19 +128,19 @@ class CryptoService {
     required String aad,
   }) async {
     final nonce = base64Decode(nonceB64);
-    final combined = base64Decode(ciphertextB64);
+    final ctAndTag = base64Decode(ciphertextB64);
 
-    if (combined.length < 17) {
+    if (ctAndTag.length < 16) {
       throw StateError("Ciphertext too short");
     }
 
-    final macBytes = combined.sublist(combined.length - 16);
-    final ct = combined.sublist(0, combined.length - 16);
+    final ct = ctAndTag.sublist(0, ctAndTag.length - 16);
+    final tag = ctAndTag.sublist(ctAndTag.length - 16);
 
-    final secretBox = SecretBox(ct, nonce: nonce, mac: Mac(macBytes));
+    final box = SecretBox(ct, nonce: nonce, mac: Mac(tag));
 
     final clear = await _aead.decrypt(
-      secretBox,
+      box,
       secretKey: sessionKey,
       aad: utf8.encode(aad),
     );

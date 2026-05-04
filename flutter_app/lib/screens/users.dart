@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import '../api.dart';
 import '../auth_store.dart';
+import '../config.dart';
 
 class UsersScreen extends StatefulWidget {
   const UsersScreen({super.key});
@@ -11,7 +12,7 @@ class UsersScreen extends StatefulWidget {
 
 class _UsersScreenState extends State<UsersScreen> {
   // CHANGE THIS IF NEEDED:
-  final Api api = Api("http://10.0.2.2:8000");
+  final Api api = Api(AppConfig.baseUrl);
   final AuthStore auth = AuthStore();
 
   bool _loading = true;
